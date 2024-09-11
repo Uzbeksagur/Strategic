@@ -1,74 +1,97 @@
 import ccxt
-import os
 import pandas as pd
 from datetime import datetime
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import os
 import dropbox
 
 # Configurare exchange și simbol
-exchange = ccxt.binance()
-symbol = 'WLD/USDT'
+exchange = ccxt.bybit({
+    'proxies': {
+        'http': '130.61.171.71:80',
+        'http': '116.203.28.43:80',
+        'http': '188.40.59.208:80',
+        'http': '202.61.206.250:8888',
+        'http': '94.130.94.45:80',
+        'http': '51.254.78.223:80',
+    },
+    'rateLimit': 1000,
+    'enableRateLimit': True,
+})
+symbol = 'WEMIX/USDT'
 
+# Token de autentificare Dropbox
 DROPBOX_TOKEN = os.environ.get('token')
-
 dbx = dropbox.Dropbox(DROPBOX_TOKEN)
 
+# Functie pentru a genera intervalele de valori pentru procente
 def frange(start, stop, step):
     while start <= stop:
-        yield round(start, 3)  # Rotunjire pentru procente
+        yield round(start, 3)
         start += step
 
-# Setarea perioadei de analiză
-start_date = '2024-01-01'
-end_date = '2024-08-30'
-
-# Convertirea datelor în timestamp-uri Unix
-start_timestamp = exchange.parse8601(start_date + 'T00:00:00Z')
-end_timestamp = exchange.parse8601(end_date + 'T00:00:00Z')
-
 # Intervalele pentru procente
-signal_percent_range = [round(x, 3) for x in frange(0.014, 0.036, 0.002)]
-profit_percent_range = [round(x, 3) for x in frange(0.01, 0.036, 0.002)]
-stop_loss_percent_range = [round(x, 2) for x in frange(0.15, 0.30, 0.01)]
+signal_percent_range = [round(x, 3) for x in frange(0.014, 0.04, 0.002)]
+profit_percent_range = [round(x, 3) for x in frange(0.01, 0.04, 0.002)]
+stop_loss_percent_range = [round(x, 2) for x in frange(0.15, 0.3, 0.01)]
 
-# Fișier pentru rezultate
-results_file = 'trade_results.csv'
-dropbox_file_path = '/trade_results.csv'
+# Funcție pentru încărcarea fișierului pe Dropbox
+def upload_to_dropbox(local_path, dropbox_path):
+    with open(local_path, "rb") as f:
+        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
 
-# Inițializarea fișierului pentru rezultate
-with open(results_file, 'w') as file:
-    file.write('signal_percent,profit_percent,stop_loss_percent,profitable_trades,unprofitable_trades,difference\n')
+# Funcție pentru descărcarea lumânărilor de 30 de minute
+def download_candles(timeframe, since):
+    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=1000)
 
-def process_trades(signal_percent, profit_percent, stop_loss_percent):
-    buy_limit_percent = 1 - signal_percent
-    sell_limit_percent = 1 + signal_percent
+# Descărcarea tuturor lumânărilor de 30 de minute folosind threading
+def download_all_data(start_date, end_date):
+    start_timestamp = exchange.parse8601(start_date + 'T00:00:00Z')
+    end_timestamp = exchange.parse8601(end_date + 'T00:00:00Z')
 
-    # Listă pentru stocarea tuturor datelor de lumânări
     all_candles = []
-
-    # Descărcarea tuturor lumânărilor folosind o buclă
     current_timestamp = start_timestamp
-    while current_timestamp < end_timestamp:
-        candles = exchange.fetch_ohlcv(symbol, timeframe='30m', since=current_timestamp, limit=1000)
-        if not candles:
-            break
-        all_candles.extend(candles)
-        current_timestamp = candles[-1][0]
 
-    # Convertirea în DataFrame
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        while current_timestamp < end_timestamp:
+            futures.append(executor.submit(download_candles, '30m', current_timestamp))
+            current_timestamp += 1000 * 30 * 60 * 1000  # Incrementarea cu numărul de lumânări * 30m
+
+        for future in as_completed(futures):
+            all_candles.extend(future.result())
+
+    # Convertirea datelor în DataFrame pentru prelucrare ulterioară
     df_1h = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_1h['timestamp'] = pd.to_datetime(df_1h['timestamp'], unit='ms')
 
-    # Inițializarea listelor pentru tranzacțiile profitabile și neprofitabile
+    return df_1h
+
+# Cache pentru datele de 1 minut
+minute_data_cache = {}
+
+# Funcție pentru descărcarea și stocarea datelor de 1 minut în cache
+def get_minute_data(start_time):
+    if start_time in minute_data_cache:
+        return minute_data_cache[start_time]
+
+    minute_candles = exchange.fetch_ohlcv(symbol, timeframe='1m', since=int(start_time.timestamp() * 1000), limit=30)
+    df_1m = pd.DataFrame(minute_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
+    minute_data_cache[start_time] = df_1m
+
+    return df_1m
+
+# Funcția de procesare a tranzacțiilor folosind multiprocessing
+def process_trades(df_1h, signal_percent, profit_percent, stop_loss_percent):
+    buy_limit_percent = 1 - signal_percent
+    sell_limit_percent = 1 + signal_percent
     profitable_trades = 0
     unprofitable_trades = 0
-
-    # Suma valorilor tranzacțiilor profitabile și neprofitabile
     total_profitable_value = 0
     total_unprofitable_value = 0
 
-    # Analizarea fiecărei lumânări de o oră
     for i in range(len(df_1h)):
         open_price = df_1h.loc[i, 'open']
         high_price = df_1h.loc[i, 'high']
@@ -96,9 +119,7 @@ def process_trades(signal_percent, profit_percent, stop_loss_percent):
             trade_type = 'SELL'
 
         if trade_opened:
-            minute_candles = exchange.fetch_ohlcv(symbol, timeframe='1m', since=int(open_timestamp.timestamp() * 1000), limit=30)
-            df_1m = pd.DataFrame(minute_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
+            df_1m = get_minute_data(open_timestamp)
 
             for j in range(len(df_1m)):
                 current_high = df_1m.loc[j, 'high']
@@ -131,6 +152,7 @@ def process_trades(signal_percent, profit_percent, stop_loss_percent):
                             unprofitable_trades += 1
                             break
 
+            # Dacă tranzacția nu s-a închis în lumânările de 1 minut, continuă cu cele de 30 de minute
             if close_timestamp is None:
                 for k in range(i + 1, len(df_1h)):
                     next_high = df_1h.loc[k, 'high']
@@ -157,33 +179,43 @@ def process_trades(signal_percent, profit_percent, stop_loss_percent):
                             unprofitable_trades += 1
                             break
 
-    # Calculul diferenței procentuale dintre tranzacțiile profitabile și neprofitabile
     difference = total_profitable_value - total_unprofitable_value
     difference_sign = "+" if difference > 0 else "-"
-    
+
     return (signal_percent, profit_percent, stop_loss_percent, profitable_trades, unprofitable_trades, f"{difference_sign}{abs(difference):.2f}")
 
-def upload_to_dropbox(local_path, dropbox_path):
-    with open(local_path, "rb") as f:
-        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
+# Funcția de execuție a tranzacțiilor cu multiprocessing
+def execute_trades(df_1h):
+    results_file = 'trade_results.csv'
+    dropbox_file_path = '/trade_results.csv'
 
-# Utilizarea ThreadPoolExecutor pentru a executa sarcinile în paralel
-with ThreadPoolExecutor(max_workers=4) as executor:
-    futures = []
-    for signal_percent in signal_percent_range:
-        for profit_percent in profit_percent_range:
-            for stop_loss_percent in stop_loss_percent_range:
-                futures.append(executor.submit(process_trades, signal_percent, profit_percent, stop_loss_percent))
+    with open(results_file, 'w') as file:
+        file.write('signal_percent,profit_percent,stop_loss_percent,profitable_trades,unprofitable_trades,difference\n')
 
-    # Adăugarea unui progress bar folosind tqdm
-    for future in tqdm(as_completed(futures), total=len(futures)):
-        result = future.result()
-        signal_percent, profit_percent, stop_loss_percent, profitable_trades, unprofitable_trades, difference = result
-        # Salvarea rezultatelor în fișier
-        with open(results_file, 'a') as file:
-            file.write(f'{signal_percent},{profit_percent},{stop_loss_percent},{profitable_trades},{unprofitable_trades},{difference}\n')
-        
-        # Încărcarea imediată pe Dropbox după fiecare scriere
-        upload_to_dropbox(results_file, dropbox_file_path)
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = []
+        for signal_percent in signal_percent_range:
+            for profit_percent in profit_percent_range:
+                for stop_loss_percent in stop_loss_percent_range:
+                    futures.append(executor.submit(process_trades, df_1h, signal_percent, profit_percent, stop_loss_percent))
 
-print("Finalizat")
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            result = future.result()
+            signal_percent, profit_percent, stop_loss_percent, profitable_trades, unprofitable_trades, difference = result
+            # Salvarea rezultatelor în fișier
+            with open(results_file, 'a') as file:
+                file.write(f'{signal_percent},{profit_percent},{stop_loss_percent},{profitable_trades},{unprofitable_trades},{difference}\n')
+
+            # Încărcarea imediată pe Dropbox după fiecare scriere
+            upload_to_dropbox(results_file, dropbox_file_path)
+
+if __name__ == '__main__':
+    # Parametri de timp pentru descărcarea datelor
+    start_date = '2023-12-01'
+    end_date = '2024-08-30'
+
+    # Rulează descărcarea și procesarea datelor
+    df_1h = download_all_data(start_date, end_date)
+    execute_trades(df_1h)
+
+    print("Finalizat")
